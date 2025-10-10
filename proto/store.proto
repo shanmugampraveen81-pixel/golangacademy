@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "c:/GoPractice/unified-go-prog/proto";
+
+message Message {
+    string userID = 1;
+    string message = 2;
+    string timestamp = 3;
+}
+
+message SaveRequest {
+    string userID = 1;
+    string message = 2;
+}
+
+message SaveResponse {}
+
+message GetLast10Request {}
+
+message GetLast10Response {
+    repeated string messages = 1;
+}
+
+service Store {
+    rpc Save(SaveRequest) returns (SaveResponse);
+    rpc GetLast10(GetLast10Request) returns (GetLast10Response);
+}
