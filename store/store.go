@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -76,22 +77,65 @@ func (s *FileStore) GetLast10Messages(ctx context.Context, logger *slog.Logger) 
 	}
 	defer file.Close()
 
+	// Efficiently read last 10 lines
+	const maxLines = 10
 	var lines []string
-	scanner := bufio.NewScanner(file)
+	stat, err := file.Stat()
+	if err != nil {
+		logger.Error("failed to stat file", "error", err)
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+	var (
+		size   = stat.Size()
+		offset = int64(0)
+		chunk  = int64(4096)
+		buf    []byte
+	)
+	if size == 0 {
+		return nil, nil
+	}
+	for {
+		if size-chunk < 0 {
+			chunk = size
+			offset = 0
+		} else {
+			offset = size - chunk
+		}
+		tmp := make([]byte, chunk)
+		_, err := file.ReadAt(tmp, offset)
+		if err != nil {
+			logger.Error("failed to read chunk", "error", err)
+			return nil, fmt.Errorf("failed to read chunk: %w", err)
+		}
+		buf = append(tmp, buf...)
+		// Count newlines
+		count := 0
+		for i := len(buf) - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				count++
+				if count >= maxLines+1 {
+					buf = buf[i+1:]
+					break
+				}
+			}
+		}
+		if count >= maxLines+1 || offset == 0 {
+			break
+		}
+		size = offset
+	}
+	// Split into lines
+	scanner := bufio.NewScanner(bufio.NewReaderSize(bytes.NewReader(buf), len(buf)))
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
-
 	if err := scanner.Err(); err != nil {
-		logger.Error("failed to read file", "error", err)
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		logger.Error("failed to scan lines", "error", err)
+		return nil, fmt.Errorf("failed to scan lines: %w", err)
 	}
-
-	// Get the last 10 lines
-	start := 0
-	if len(lines) > 10 {
-		start = len(lines) - 10
+	// Only return the last 10 lines
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
 	}
-
-	return lines[start:], nil
+	return lines, nil
 }

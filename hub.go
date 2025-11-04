@@ -10,16 +10,18 @@ type Hub struct {
 	unregister chan *Client
 	shutdown   chan struct{}
 	logger     *slog.Logger
+	closed     map[*Client]bool // Track closed channels
 }
 
 func newHub(logger *slog.Logger) *Hub {
 	return &Hub{
-		broadcast:  make(chan []byte),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		broadcast:  make(chan []byte, 1000),
+		register:   make(chan *Client, 100),
+		unregister: make(chan *Client, 100),
 		clients:    make(map[*Client]bool),
 		shutdown:   make(chan struct{}),
 		logger:     logger,
+		closed:     make(map[*Client]bool),
 	}
 }
 
@@ -28,11 +30,15 @@ func (h *Hub) run() {
 		select {
 		case client := <-h.register:
 			h.clients[client] = true
+			h.closed[client] = false
 			h.logger.Info("client registered")
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
+				if !h.closed[client] {
+					close(client.send)
+					h.closed[client] = true
+				}
 				h.logger.Info("client unregistered")
 			}
 		case message := <-h.broadcast:
@@ -41,14 +47,20 @@ func (h *Hub) run() {
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
+					if !h.closed[client] {
+						close(client.send)
+						h.closed[client] = true
+					}
 					delete(h.clients, client)
 				}
 			}
 		case <-h.shutdown:
 			h.logger.Info("hub shutting down")
 			for client := range h.clients {
-				close(client.send)
+				if !h.closed[client] {
+					close(client.send)
+					h.closed[client] = true
+				}
 				delete(h.clients, client)
 			}
 			return

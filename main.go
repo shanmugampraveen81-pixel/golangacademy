@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,13 +20,108 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-type key string
+// Config holds application configuration
+type Config struct {
+	MessageFile    string
+	RateLimitRPS   float64
+	RateLimitBurst int
+}
 
-const traceIDKey key = "traceID"
+// LoadConfig loads config from environment variables or uses defaults
+func LoadConfig() *Config {
+	cfg := &Config{
+		MessageFile:    getEnv("MESSAGE_FILE", "messages.txt"),
+		RateLimitRPS:   getEnvFloat("RATE_LIMIT_RPS", 1.0),
+		RateLimitBurst: getEnvInt("RATE_LIMIT_BURST", 5),
+	}
+	return cfg
+}
+
+func getEnv(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func getEnvFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+func getEnvInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
+// rateLimiterMap holds a map of IP addresses to rate limiters
+var rateLimiterMap = struct {
+	sync.Mutex
+	m map[string]*rate.Limiter
+}{m: make(map[string]*rate.Limiter)}
+
+// rateLimiterConfig holds the global rate limiting settings
+var rateLimiterConfig = struct {
+	rps   float64
+	burst int
+}{rps: 1.0, burst: 5}
+
+// getRateLimiter returns a rate limiter for the given IP address
+func getRateLimiter(ip string) *rate.Limiter {
+	rateLimiterMap.Lock()
+	defer rateLimiterMap.Unlock()
+	limiter, exists := rateLimiterMap.m[ip]
+	if !exists {
+		limiter = rate.NewLimiter(rate.Limit(rateLimiterConfig.rps), rateLimiterConfig.burst) // Dynamic RPS and burst
+		rateLimiterMap.m[ip] = limiter
+	}
+	return limiter
+}
+
+// rateLimitMiddleware enforces rate limiting per IP
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := r.RemoteAddr
+		if ipHeader := r.Header.Get("X-Real-IP"); ipHeader != "" {
+			ip = ipHeader
+		} else if ipHeader = r.Header.Get("X-Forwarded-For"); ipHeader != "" {
+			ip = ipHeader
+		}
+		limiter := getRateLimiter(ip)
+		if !limiter.Allow() {
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type contextKey string
+
+const (
+	traceIDKey contextKey = "traceID"
+	loggerKey  contextKey = "logger"
+)
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -93,13 +190,14 @@ func runCLI(logger *slog.Logger, client proto.StoreClient, user, msg *string) {
 }
 
 func runServer(logger *slog.Logger, client proto.StoreClient, hub *Hub) {
+
 	mux := http.NewServeMux()
-	mux.Handle("/message", traceIDMiddleware(logger, messageHandler(logger, client, hub)))
+	mux.Handle("/message", rateLimitMiddleware(traceIDMiddleware(logger, messageHandler(logger, client, hub))))
 	mux.HandleFunc("/about", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "about.html")
 	})
-	mux.Handle("/list", traceIDMiddleware(logger, listHandler(logger, client)))
-	mux.Handle("/ws", traceIDMiddleware(logger, wsHandler(logger, client, hub)))
+	mux.Handle("/list", rateLimitMiddleware(traceIDMiddleware(logger, listHandler(logger, client))))
+	mux.Handle("/ws", rateLimitMiddleware(traceIDMiddleware(logger, wsHandler(logger, client, hub))))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("Health check endpoint hit")
 		w.WriteHeader(http.StatusOK)
@@ -146,8 +244,8 @@ func traceIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), traceIDKey, traceID)
 		// Add traceID to logger
 		middlewareLogger := logger.With("traceID", traceID)
-		// Add logger to context
-		ctx = context.WithValue(ctx, "logger", middlewareLogger)
+		// Add logger to context using typed key
+		ctx = context.WithValue(ctx, loggerKey, middlewareLogger)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -186,7 +284,7 @@ func messageHandler(logger *slog.Logger, client proto.StoreClient, hub *Hub) htt
 		// Optionally, add more content validation (e.g., allowed chars)
 
 		// Retrieve the logger from the context
-		ctxLogger, ok := r.Context().Value("logger").(*slog.Logger)
+		ctxLogger, ok := r.Context().Value(loggerKey).(*slog.Logger)
 		if !ok {
 			// Fallback to the base logger if not found
 			ctxLogger = logger
@@ -195,14 +293,14 @@ func messageHandler(logger *slog.Logger, client proto.StoreClient, hub *Hub) htt
 		_, err := client.Save(r.Context(), &proto.SaveRequest{UserID: req.UserID, Message: req.Message})
 		if err != nil {
 			ctxLogger.Error("Failed to save message", "error", err)
-			http.Error(w, "Failed to save message", http.StatusInternalServerError)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		jsonMsg, err := json.Marshal(req)
 		if err != nil {
 			ctxLogger.Error("Failed to marshal message", "error", err)
-			http.Error(w, "Failed to marshal message", http.StatusInternalServerError)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		hub.broadcast <- jsonMsg
@@ -216,7 +314,7 @@ func messageHandler(logger *slog.Logger, client proto.StoreClient, hub *Hub) htt
 func listHandler(logger *slog.Logger, client proto.StoreClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Retrieve the logger from the context
-		ctxLogger, ok := r.Context().Value("logger").(*slog.Logger)
+		ctxLogger, ok := r.Context().Value(loggerKey).(*slog.Logger)
 		if !ok {
 			// Fallback to the base logger if not found
 			ctxLogger = logger
@@ -225,20 +323,20 @@ func listHandler(logger *slog.Logger, client proto.StoreClient) http.Handler {
 		resp, err := client.GetLast10(r.Context(), &proto.GetLast10Request{})
 		if err != nil {
 			ctxLogger.Error("Failed to get messages", "error", err)
-			http.Error(w, "Failed to get messages", http.StatusInternalServerError)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		tmpl, err := template.ParseFiles("list.html")
 		if err != nil {
 			ctxLogger.Error("Failed to parse template", "error", err)
-			http.Error(w, "Failed to parse template", http.StatusInternalServerError)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		if err := tmpl.Execute(w, resp.Messages); err != nil {
 			ctxLogger.Error("Failed to execute template", "error", err)
-			http.Error(w, "Failed to execute template", http.StatusInternalServerError)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 	})
