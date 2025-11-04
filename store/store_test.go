@@ -16,8 +16,8 @@ func TestSaveAndGetMessages(t *testing.T) {
 	}
 	defer os.Remove(tmpfile.Name()) // clean up
 
-	// Set the fileName to the temporary file
-	fileName = tmpfile.Name()
+	// Use a dedicated FileStore for this test
+	testStore := &FileStore{FileName: tmpfile.Name()}
 
 	// Create a logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -26,13 +26,13 @@ func TestSaveAndGetMessages(t *testing.T) {
 	// Test saving a message
 	userID := "testuser"
 	message := "hello test"
-	err = SaveMessage(ctx, logger, userID, message)
+	err = testStore.SaveMessage(ctx, logger, userID, message)
 	if err != nil {
 		t.Fatalf("SaveMessage failed: %v", err)
 	}
 
 	// Test getting messages
-	messages, err := GetLast10Messages(ctx, logger)
+	messages, err := testStore.GetLast10Messages(ctx, logger)
 	if err != nil {
 		t.Fatalf("GetLast10Messages failed: %v", err)
 	}

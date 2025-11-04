@@ -17,12 +17,13 @@ import (
 type server struct {
 	proto.UnimplementedStoreServer
 	logger *slog.Logger
+	store  *store.FileStore
 }
 
 // Save implements proto.StoreServer
 func (s *server) Save(ctx context.Context, req *proto.SaveRequest) (*proto.SaveResponse, error) {
 	s.logger.Info("Saving message", "userID", req.UserID, "message", req.Message)
-	if err := store.SaveMessage(ctx, s.logger, req.UserID, req.Message); err != nil {
+	if err := s.store.SaveMessage(ctx, s.logger, req.UserID, req.Message); err != nil {
 		return nil, err
 	}
 	return &proto.SaveResponse{}, nil
@@ -31,11 +32,10 @@ func (s *server) Save(ctx context.Context, req *proto.SaveRequest) (*proto.SaveR
 // GetLast10 implements proto.StoreServer
 func (s *server) GetLast10(ctx context.Context, req *proto.GetLast10Request) (*proto.GetLast10Response, error) {
 	s.logger.Info("Getting last 10 messages")
-	messages, err := store.GetLast10Messages(ctx, s.logger)
+	messages, err := s.store.GetLast10Messages(ctx, s.logger)
 	if err != nil {
 		return nil, err
 	}
-
 	return &proto.GetLast10Response{Messages: messages}, nil
 }
 
@@ -46,7 +46,8 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	s := grpc.NewServer()
-	proto.RegisterStoreServer(s, &server{logger: logger})
+	storeInst := &store.FileStore{FileName: "messages.txt"}
+	proto.RegisterStoreServer(s, &server{logger: logger, store: storeInst})
 	logger.Info("gRPC server listening on :50051")
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)

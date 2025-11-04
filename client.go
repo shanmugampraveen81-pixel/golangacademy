@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -22,13 +23,11 @@ const (
 
 // Client is a middleman between the websocket connection and the hub.
 type Client struct {
-	hub *Hub
-
-	// The websocket connection.
-	conn *websocket.Conn
-
-	// Buffered channel of outbound messages.
-	send chan []byte
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan []byte
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -36,19 +35,27 @@ func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
+		if c.cancel != nil {
+			c.cancel()
+		}
 	}()
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				c.hub.logger.Error("websocket error", "error", err)
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+			_, message, err := c.conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					c.hub.logger.Error("websocket error", "error", err)
+				}
+				return
 			}
-			break
+			c.hub.broadcast <- message
 		}
-		c.hub.broadcast <- message
 	}
 }
 
@@ -61,6 +68,8 @@ func (c *Client) writePump() {
 	}()
 	for {
 		select {
+		case <-c.ctx.Done():
+			return
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {

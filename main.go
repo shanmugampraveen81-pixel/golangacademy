@@ -14,11 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"unified-go-prog/proto"
+
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"unified-go-prog/proto"
 )
 
 type key string
@@ -28,6 +29,12 @@ const traceIDKey key = "traceID"
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		// Only allow requests from the same host (adjust as needed)
+		origin := r.Header.Get("Origin")
+		allowed := "http://" + r.Host
+		return origin == allowed || origin == "https://"+r.Host
+	},
 }
 
 func main() {
@@ -93,6 +100,11 @@ func runServer(logger *slog.Logger, client proto.StoreClient, hub *Hub) {
 	})
 	mux.Handle("/list", traceIDMiddleware(logger, listHandler(logger, client)))
 	mux.Handle("/ws", traceIDMiddleware(logger, wsHandler(logger, client, hub)))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("Health check endpoint hit")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -116,6 +128,10 @@ func runServer(logger *slog.Logger, client proto.StoreClient, hub *Hub) {
 	// Create a context with a timeout for shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Gracefully shut down the hub
+	hub.Shutdown()
+	logger.Info("Hub shutdown initiated")
 
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("Server shutdown failed", "error", err)
@@ -144,15 +160,30 @@ type MessageRequest struct {
 func messageHandler(logger *slog.Logger, client proto.StoreClient, hub *Hub) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			logger.Warn("Invalid method for /message", "method", r.Method)
 			http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req MessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			logger.Warn("Invalid request body", "error", err)
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
+
+		// Input validation
+		if len(req.UserID) == 0 || len(req.UserID) > 64 {
+			logger.Warn("Invalid userID length", "userID", req.UserID)
+			http.Error(w, "Invalid userID", http.StatusBadRequest)
+			return
+		}
+		if len(req.Message) == 0 || len(req.Message) > 1024 {
+			logger.Warn("Invalid message length", "userID", req.UserID, "length", len(req.Message))
+			http.Error(w, "Invalid message length", http.StatusBadRequest)
+			return
+		}
+		// Optionally, add more content validation (e.g., allowed chars)
 
 		// Retrieve the logger from the context
 		ctxLogger, ok := r.Context().Value("logger").(*slog.Logger)
@@ -215,29 +246,39 @@ func listHandler(logger *slog.Logger, client proto.StoreClient) http.Handler {
 
 func wsHandler(logger *slog.Logger, client proto.StoreClient, hub *Hub) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logger.Error("Failed to upgrade connection", "error", err)
 			return
 		}
-		wsClient := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+		wsClient := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), ctx: ctx, cancel: cancel}
 		wsClient.hub.register <- wsClient
 
 		// Send last 10 messages to the client
 		go func() {
-			resp, err := client.GetLast10(r.Context(), &proto.GetLast10Request{})
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Recovered in wsClient send", "error", r)
+				}
+			}()
+			resp, err := client.GetLast10(ctx, &proto.GetLast10Request{})
 			if err != nil {
 				logger.Error("Failed to get messages", "error", err)
 				return
 			}
-
 			for _, msg := range resp.Messages {
-				wsClient.send <- []byte(msg)
+				select {
+				case wsClient.send <- []byte(msg):
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 
-		// Allow collection of memory referenced by the caller by doing all work in
-		// new goroutines.
+		// Ensure goroutines are cleaned up on disconnect
 		go wsClient.writePump()
 		go wsClient.readPump()
 	})
